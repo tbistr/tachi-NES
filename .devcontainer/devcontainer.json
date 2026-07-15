@@ -1,0 +1,11 @@
+{
+  "name": "Ubuntu 24.04",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["oxc.oxc-vscode"]
+    }
+  }
+}

@@ -1,0 +1,194 @@
+:root {
+  --ink: #e9eadf;
+  --muted: #8d9188;
+  --red: #ff4d39;
+  --panel: #171a19;
+  --line: #353a36;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: #0b0d0c;
+  color: var(--ink);
+  font-family: "Courier New", monospace;
+}
+button,
+input {
+  font: inherit;
+}
+main {
+  width: min(1100px, 100%);
+  margin: auto;
+  padding: 38px 28px 22px;
+}
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: end;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 22px;
+  margin-bottom: 28px;
+}
+h1 {
+  margin: 4px 0 0;
+  font:
+    800 clamp(2.5rem, 7vw, 5.5rem)/0.85 Arial,
+    sans-serif;
+  letter-spacing: -0.08em;
+}
+h1 em {
+  color: var(--red);
+  font-style: normal;
+}
+.eyebrow,
+.cartridge-status span {
+  color: var(--red);
+  letter-spacing: 0.22em;
+  font-size: 0.72rem;
+}
+.cartridge-status {
+  text-align: right;
+  max-width: 300px;
+}
+.cartridge-status strong {
+  display: block;
+  margin-top: 7px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 230px;
+  gap: 20px;
+}
+.console,
+.debugger {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  padding: 18px;
+}
+.screen-shell {
+  position: relative;
+  max-width: 768px;
+  margin: auto;
+  aspect-ratio: 256/240;
+  background: #050605;
+  box-shadow: 0 0 0 8px #242824;
+}
+canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  image-rendering: pixelated;
+}
+.screen-placeholder {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 0.8rem;
+  letter-spacing: 0.12em;
+}
+.controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 24px;
+}
+.rom-selector {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+.rom-selector p {
+  width: 100%;
+  margin: 0;
+  color: #ff8a7d;
+}
+.rom-button,
+button {
+  border: 1px solid var(--red);
+  background: transparent;
+  color: var(--ink);
+  padding: 10px 14px;
+  cursor: pointer;
+}
+.rom-button:hover,
+button:hover:not(:disabled) {
+  background: var(--red);
+  color: #080909;
+}
+.rom-button input {
+  display: none;
+}
+button:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.debugger h2 {
+  margin: 0 0 20px;
+  color: var(--red);
+  font-size: 0.8rem;
+  letter-spacing: 0.2em;
+}
+dl {
+  margin: 0;
+}
+dl div {
+  display: flex;
+  justify-content: space-between;
+  border-top: 1px solid var(--line);
+  padding: 10px 0;
+}
+dt {
+  color: var(--muted);
+}
+dd {
+  margin: 0;
+}
+.debugger p {
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.6;
+  margin-top: 28px;
+}
+footer {
+  margin-top: 18px;
+  color: #5f645f;
+  font-size: 0.65rem;
+  text-align: center;
+}
+@media (max-width: 720px) {
+  main {
+    padding: 24px 14px;
+  }
+  header {
+    align-items: start;
+  }
+  .cartridge-status {
+    display: none;
+  }
+  .workspace {
+    grid-template-columns: 1fr;
+  }
+  .debugger {
+    display: none;
+  }
+  .controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  button {
+    width: 100%;
+  }
+}

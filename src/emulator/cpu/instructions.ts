@@ -1,18 +1,3 @@
-export type AddressingMode =
-  | "imp"
-  | "acc"
-  | "imm"
-  | "zp"
-  | "zpx"
-  | "zpy"
-  | "abs"
-  | "abx"
-  | "aby"
-  | "ind"
-  | "izx"
-  | "izy"
-  | "rel";
-
 export type Operation =
   | "ADC"
   | "AND"
@@ -70,6 +55,21 @@ export type Operation =
   | "TXA"
   | "TXS"
   | "TYA";
+
+export type AddressingMode =
+  | "imp"
+  | "acc"
+  | "imm"
+  | "zp"
+  | "zpx"
+  | "zpy"
+  | "abs"
+  | "abx"
+  | "aby"
+  | "ind"
+  | "izx"
+  | "izy"
+  | "rel";
 
 export type Instruction = {
   operation: Operation;

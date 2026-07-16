@@ -76,9 +76,10 @@ export class Cpu {
 
   /** Executes one complete instruction and returns the number of consumed cycles. */
   step() {
-    const at = this.pc,
-      opcode = this.read(this.pc++),
-      instruction = INSTRUCTIONS[opcode];
+    const at = this.pc;
+    const opcode = this.read(this.pc);
+    this.pc = (this.pc + 1) & 0xffff;
+    const instruction = INSTRUCTIONS[opcode];
     if (!instruction)
       throw new Error(
         `undefined opcode $${opcode.toString(16).padStart(2, "0")} at $${at.toString(16).padStart(4, "0")}`,
@@ -147,7 +148,11 @@ export class Cpu {
 
   /** Resolves an instruction operand using its addressing mode. */
   private resolveOperand(mode: AddressingMode): Operand {
-    const fetch = () => this.read(this.pc++);
+    const fetch = () => {
+      const value = this.read(this.pc);
+      this.pc = (this.pc + 1) & 0xffff;
+      return value;
+    };
     const fetch16 = () => {
       const v = this.read16(this.pc);
       this.pc = (this.pc + 2) & 0xffff;

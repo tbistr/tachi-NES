@@ -89,8 +89,6 @@ describe("6502 disassembler", () => {
     expect(lines[0].instruction).toMatchObject({
       operation: "NOP",
       mode: "imp",
-      bytes: 1,
-      cycles: 2,
     });
   });
 

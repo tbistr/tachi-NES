@@ -1,8 +1,11 @@
-import type { AddressingMode, Instruction } from "./instructions";
+import type { AddressingMode, Operation } from "./instructions";
 import { INSTRUCTIONS } from "./instructions";
 
 export interface CpuBus {
+  /** Reads one byte from the CPU address space. */
   read(address: number): number;
+
+  /** Writes one byte to the CPU address space. */
   write(address: number, value: number): void;
 }
 
@@ -17,474 +20,942 @@ export const CpuFlag = {
   negative: 0x80,
 } as const;
 
-type Operand =
-  | { kind: "none"; pageCrossed: false }
-  | { kind: "value"; value: number; pageCrossed: false }
-  | { kind: "address"; address: number; pageCrossed: boolean };
+export type SequenceKind = "instruction" | "reset" | "irq" | "nmi";
 
+type OperandPattern = "read" | "write" | "modify";
+type InstructionPattern = OperandPattern | "branch" | "control" | "accumulator" | "implied";
+
+/** Serializable state for a CPU sequence that is currently in flight. */
+export interface CpuExecutionState {
+  /** Identifies whether the CPU is executing an instruction, RESET, IRQ, or NMI sequence. */
+  kind: SequenceKind;
+  /** Number of cycles already completed in this sequence; zero before its first cycle. */
+  cycle: number;
+  /** Fetched opcode; available for instruction sequences after the opcode-fetch cycle. */
+  opcode?: number;
+  /** Decoded instruction operation, such as LDA or BRK; only present for instructions. */
+  operation?: Operation;
+  /** Decoded addressing mode; only present for instructions after opcode fetch. */
+  mode?: AddressingMode;
+  /** Reusable low-byte latch for operands, addresses, return addresses, and vectors. */
+  lo: number;
+  /** Reusable high-byte latch for operands, addresses, return addresses, and vectors. */
+  hi: number;
+  /** Final effective address, branch target, or stack-restored return address. */
+  address: number;
+  /** Pre-carry address used for indexed dummy reads and page-cross branch reads. */
+  provisionalAddress: number;
+  /** Data byte retained between read, dummy-write, and final-write cycles. */
+  data: number;
+  /** Whether indexed addressing or a taken branch crossed a 256-byte page boundary. */
+  pageCrossed: boolean;
+  /** Whether the condition of the active branch instruction evaluated to true. */
+  branchTaken: boolean;
+  /** First vector address for IRQ or NMI entry; absent for instructions and RESET. */
+  vector?: number;
+}
+
+/** Serializable CPU state, including any partially completed sequence. */
+export interface CpuState {
+  a: number;
+  x: number;
+  y: number;
+  sp: number;
+  pc: number;
+  status: number;
+  totalCycles: number;
+  irqLine: boolean;
+  irqRecognized: boolean;
+  nmiLine: boolean;
+  nmiLatched: boolean;
+  execution?: CpuExecutionState;
+}
+
+const RESET_VECTOR = 0xfffc;
+const NMI_VECTOR = 0xfffa;
+const IRQ_VECTOR = 0xfffe;
+
+const readOperations = new Set<Operation>([
+  "ADC",
+  "AND",
+  "BIT",
+  "CMP",
+  "CPX",
+  "CPY",
+  "EOR",
+  "LDA",
+  "LDX",
+  "LDY",
+  "ORA",
+  "SBC",
+]);
+const writeOperations = new Set<Operation>(["STA", "STX", "STY"]);
+const modifyOperations = new Set<Operation>(["ASL", "DEC", "INC", "LSR", "ROL", "ROR"]);
+
+const branchOperations = new Set<Operation>([
+  "BCC",
+  "BCS",
+  "BEQ",
+  "BMI",
+  "BNE",
+  "BPL",
+  "BVC",
+  "BVS",
+]);
+const controlOperations = new Set<Operation>([
+  "JMP",
+  "JSR",
+  "RTS",
+  "BRK",
+  "RTI",
+  "PHA",
+  "PHP",
+  "PLA",
+  "PLP",
+]);
+
+/** Creates zeroed latch state for a new execution sequence. */
+function createExecutionState(kind: SequenceKind, vector?: number): CpuExecutionState {
+  return {
+    kind,
+    cycle: 0,
+    lo: 0,
+    hi: 0,
+    address: 0,
+    provisionalAddress: 0,
+    data: 0,
+    pageCrossed: false,
+    branchTaken: false,
+    vector,
+  };
+}
+
+/** Cycle-stepped Ricoh 2A03 CPU core. One clock performs at most one bus access. */
 export class Cpu {
-  // https://www.nesdev.org/wiki/CPU_power_up_state#CPU
   a = 0;
   x = 0;
   y = 0;
   sp = 0xfd;
   pc = 0;
   status = CpuFlag.interrupt | CpuFlag.unused;
-  cyclesRemaining = 0;
-  private irqPending = false;
-  private nmiPending = false;
-  private readonly bus: CpuBus;
+  /** Number of completed CPU clocks since the most recent power-on. */
+  totalCycles = 0;
 
-  /** Creates a CPU connected to the provided memory bus. */
+  private readonly bus: CpuBus;
+  private execution?: CpuExecutionState;
+  private irqLine = false;
+  private irqRecognized = false;
+  private nmiLine = false;
+  private nmiLatched = false;
+  private clockActive = false;
+  private busAccessedThisClock = false;
+
+  /** Creates a CPU connected to the bus used for all memory accesses. */
   constructor(bus: CpuBus) {
     this.bus = bus;
   }
 
-  /** Restores the CPU to its reset state and loads the reset vector. */
-  reset() {
-    // https://www.nesdev.org/wiki/CPU_power_up_state#CPU
-    this.a = this.x = this.y = 0;
-    this.sp = 0xfd;
-    this.status = CpuFlag.interrupt | CpuFlag.unused;
-    this.pc = this.read16(0xfffc);
-    // The 2A03 reset sequence takes 7 CPU cycles.
-    // https://forums.nesdev.org/viewtopic.php?t=7573
-    this.cyclesRemaining = 7;
-    this.irqPending = this.nmiPending = false;
+  /** Returns whether no instruction, RESET, IRQ, or NMI sequence is in flight. */
+  get atInstructionBoundary() {
+    return this.execution === undefined;
   }
 
-  /** Advances the CPU by one clock cycle. */
-  clock() {
-    if (this.cyclesRemaining > 0) {
-      this.cyclesRemaining--;
-      return;
-    }
-    if (this.nmiPending) {
-      this.nmiPending = false;
-      this.interrupt(0xfffa);
-      this.cyclesRemaining = 6;
-      return;
-    }
-    if (this.irqPending && !this.flag(CpuFlag.interrupt)) {
-      this.irqPending = false;
-      this.interrupt(0xfffe);
-      this.cyclesRemaining = 6;
-      return;
-    }
-    this.step();
+  /** Returns the active execution-sequence kind, or undefined while idle. */
+  get sequenceKind() {
+    return this.execution?.kind;
   }
 
-  /** Executes one complete instruction and returns the number of consumed cycles. */
-  step() {
-    const at = this.pc;
-    const opcode = this.read(this.pc);
-    this.pc = (this.pc + 1) & 0xffff;
-    const instruction = INSTRUCTIONS[opcode];
-    if (!instruction)
-      throw new Error(
-        `undefined opcode $${opcode.toString(16).padStart(2, "0")} at $${at.toString(16).padStart(4, "0")}`,
-      );
-    const operand = this.resolveOperand(instruction.mode);
-
-    let cycles =
-      instruction.cycles + (instruction.extraCycleOnPageCross && operand.pageCrossed ? 1 : 0);
-
-    cycles += this.execute(instruction, operand);
-    this.status = (this.status | CpuFlag.unused) & ~CpuFlag.break;
-
-    this.cyclesRemaining = cycles - 1;
-    return cycles;
+  /** Returns the one-based cycle within the active sequence, or zero while idle. */
+  get cycleInSequence() {
+    return this.execution?.cycle ?? 0;
   }
 
-  /** Latches a maskable interrupt request for the next instruction boundary. */
-  requestIrq() {
-    this.irqPending = true;
+  /** Returns the active instruction opcode, or undefined outside instruction execution. */
+  get currentOpcode() {
+    return this.execution?.opcode;
   }
 
-  /** Latches a non-maskable interrupt request for the next instruction boundary. */
-  requestNmi() {
-    this.nmiPending = true;
+  /** Reads and normalizes one byte from the 16-bit CPU address space. */
+  private read(address: number) {
+    this.recordBusAccess();
+    return this.bus.read(address & 0xffff) & 0xff;
   }
 
-  /** Reads one byte from the 16-bit CPU address space. */
-  private read(a: number) {
-    return this.bus.read(a & 0xffff) & 0xff;
+  /** Writes a normalized byte to the 16-bit CPU address space. */
+  private write(address: number, value: number) {
+    this.recordBusAccess();
+    this.bus.write(address & 0xffff, value & 0xff);
   }
 
-  /** Reads a little-endian word from memory. */
-  private read16(a: number) {
-    return this.read(a) | (this.read(a + 1) << 8);
+  /** Records one bus access and rejects accesses outside or repeated within a CPU clock. */
+  private recordBusAccess() {
+    if (!this.clockActive) throw new Error("CPU bus access attempted outside a clock");
+    if (this.busAccessedThisClock) throw new Error("CPU clock attempted more than one bus access");
+    this.busAccessedThisClock = true;
   }
 
-  /** Pushes CPU state and transfers control through an interrupt vector. */
-  private interrupt(vector: number) {
-    this.push16(this.pc);
-    this.push((this.status | CpuFlag.unused) & ~CpuFlag.break);
-    this.setFlag(CpuFlag.interrupt, true);
-    this.pc = this.read16(vector);
-  }
-
-  /** Pushes one byte onto the hardware stack. */
-  private push(v: number) {
-    this.bus.write(0x100 | this.sp, v & 0xff);
+  /** Writes a byte at the current stack position and then decrements SP. */
+  private pushStack(value: number) {
+    this.write(0x100 | this.sp, value);
     this.sp = (this.sp - 1) & 0xff;
   }
 
-  /** Pushes a 16-bit value onto the hardware stack, high byte first. */
-  private push16(v: number) {
-    this.push(v >> 8);
-    this.push(v);
+  /** Increments SP and then reads a byte from the resulting stack position. */
+  private pullStack() {
+    this.sp = (this.sp + 1) & 0xff;
+    return this.read(0x100 | this.sp);
   }
 
-  /** Returns whether a processor status flag is set. */
-  private flag(f: number) {
-    return (this.status & f) !== 0;
+  /** Returns whether a processor-status flag is currently set. */
+  private flag(flag: number) {
+    return (this.status & flag) !== 0;
   }
 
-  /** Sets or clears a processor status flag. */
-  private setFlag(f: number, on: boolean) {
-    this.status = on ? this.status | f : this.status & ~f;
+  /** Sets or clears one processor-status flag without changing other flags. */
+  private setFlag(flag: number, enabled: boolean) {
+    this.status = enabled ? this.status | flag : this.status & ~flag;
   }
 
-  /** Resolves an instruction operand using its addressing mode. */
-  private resolveOperand(mode: AddressingMode): Operand {
-    const fetch = () => {
-      const value = this.read(this.pc);
-      this.pc = (this.pc + 1) & 0xffff;
-      return value;
-    };
-    const fetch16 = () => {
-      const v = this.read16(this.pc);
-      this.pc = (this.pc + 2) & 0xffff;
-      return v;
-    };
-    const readZp16 = (a: number) => this.read(a) | (this.read((a + 1) & 0xff) << 8);
+  /** Fetches a byte at PC and advances PC with 16-bit wrapping. */
+  private fetchPc() {
+    const value = this.read(this.pc);
+    this.pc = (this.pc + 1) & 0xffff;
+    return value;
+  }
 
-    const zpIndexed = (index: number): Operand => {
-      const address = (fetch() + index) & 0xff;
-      return { kind: "address", address, pageCrossed: false };
-    };
-    const indexed = (base: number, index: number): Operand => {
-      const address = (base + index) & 0xffff;
-      return { kind: "address", address, pageCrossed: (base & 0xff00) !== (address & 0xff00) };
-    };
+  /** Initializes deterministic power-on state and starts the RESET sequence. */
+  powerOn() {
+    this.a = this.x = this.y = 0;
+    this.sp = 0;
+    this.pc = 0;
+    this.status = CpuFlag.interrupt | CpuFlag.unused;
+    this.irqLine = this.irqRecognized = this.nmiLine = this.nmiLatched = false;
+    this.totalCycles = 0;
+    this.beginResetSequence();
+  }
 
-    // https://www.nesdev.org/wiki/CPU_addressing_modes
-    switch (mode) {
-      // Indexed addressing
-      case "zpx":
-        return zpIndexed(this.x);
-      case "zpy":
-        return zpIndexed(this.y);
-      case "abx":
-        return indexed(fetch16(), this.x);
-      case "aby":
-        return indexed(fetch16(), this.y);
-      case "izx": {
-        const p = (fetch() + this.x) & 0xff;
-        return { kind: "address", address: readZp16(p), pageCrossed: false };
-      }
-      case "izy":
-        return indexed(readZp16(fetch()), this.y);
+  /** Starts a warm RESET while preserving registers and the lifetime cycle counter. */
+  reset() {
+    this.status = (this.status | CpuFlag.interrupt | CpuFlag.unused) & ~CpuFlag.break;
+    this.beginResetSequence();
+  }
 
-      // Other addressing
-      case "imp":
-      case "acc":
-        return { kind: "none", pageCrossed: false };
-      case "imm":
-        return { kind: "value", value: fetch(), pageCrossed: false };
-      case "zp":
-        return { kind: "address", address: fetch(), pageCrossed: false };
-      case "abs":
-        return { kind: "address", address: fetch16(), pageCrossed: false };
-      case "rel":
-        return { kind: "value", value: fetch(), pageCrossed: false };
-      case "ind": {
-        // The 6502 has a hardware bug where the high byte of an indirect address wraps around if the low byte is $FF.
-        // This means that if you try to read a 16-bit address from $xxFF, it will read the low byte from $xxFF and the high byte from $xx00 instead of $xxFF + 1.
-        // example: if p = $03FF, then lo = $03FF, hi = ($03FF & $FF00) | (($03FF + 1) & $00FF) = $0300
-        // See https://www.nesdev.org/wiki/Instruction_reference#JMP
-        const p = fetch16(),
-          lo = this.read(p),
-          hi = this.read((p & 0xff00) | ((p + 1) & 0xff));
-        return { kind: "address", address: lo | (hi << 8), pageCrossed: false };
-      }
+  /** Aborts the current sequence and starts the seven-cycle RESET state machine. */
+  private beginResetSequence() {
+    this.irqRecognized = this.nmiLatched = false;
+    this.execution = createExecutionState("reset");
+  }
+
+  /** Advances the CPU by exactly one clock, performing at most one bus access. */
+  clock() {
+    if (this.clockActive) throw new Error("CPU clock is not reentrant");
+    this.clockActive = true;
+    this.busAccessedThisClock = false;
+    try {
+      this.executeClock();
+    } finally {
+      this.clockActive = false;
     }
   }
 
-  /** Executes the operation associated with a decoded instruction.
-   *  Returns the number of additional cycles consumed by the instruction. */
-  private execute(i: Instruction, o: Operand) {
-    const address = () => {
-      if (o.kind !== "address") throw new Error("Instruction requires an address operand");
-      return o.address;
+  /** Executes and commits one clock while clock() owns the bus-access guard. */
+  private executeClock() {
+    // If no sequence is in flight, select the next instruction or recognized interrupt.
+    if (!this.execution) {
+      if (this.nmiLatched) {
+        this.nmiLatched = false;
+        this.execution = createExecutionState("nmi", NMI_VECTOR);
+      } else if (this.irqRecognized) {
+        this.irqRecognized = false;
+        this.execution = createExecutionState("irq", IRQ_VECTOR);
+      } else {
+        this.execution = createExecutionState("instruction");
+      }
+    }
+
+    // Execute one cycle of the active sequence and commit its effects.
+    const interruptDisabledAtCycleStart = this.flag(CpuFlag.interrupt);
+    const completed = this.executeCycle(this.execution!);
+    if (!this.busAccessedThisClock)
+      throw new Error("CPU clock must perform exactly one bus access");
+    this.execution!.cycle++;
+    this.totalCycles++;
+
+    if (completed) {
+      this.irqRecognized = this.irqLine && !interruptDisabledAtCycleStart;
+      this.status = (this.status | CpuFlag.unused) & ~CpuFlag.break;
+      this.execution = undefined;
+    }
+  }
+
+  /** Clocks until the current instruction or pending interrupt sequence completes. */
+  step() {
+    let cycles = 0;
+    do {
+      this.clock();
+      cycles++;
+    } while (this.execution);
+    return cycles;
+  }
+
+  /** Sets the level-sensitive IRQ input and recognizes it immediately at a boundary. */
+  setIrqLine(asserted: boolean) {
+    this.irqLine = asserted;
+    if (asserted && this.atInstructionBoundary && !this.flag(CpuFlag.interrupt))
+      this.irqRecognized = true;
+  }
+
+  /** Asserts IRQ until the caller clears it with `setIrqLine(false)`. */
+  requestIrq() {
+    this.setIrqLine(true);
+  }
+
+  /** Sets the NMI input and latches a request on its rising edge. */
+  setNmiLine(asserted: boolean) {
+    if (asserted && !this.nmiLine) this.nmiLatched = true;
+    this.nmiLine = asserted;
+  }
+
+  /** Latches one NMI request without changing the externally visible NMI line. */
+  requestNmi() {
+    this.nmiLatched = true;
+  }
+
+  /** Returns a detached, JSON-serializable snapshot of the complete CPU state. */
+  saveState(): CpuState {
+    return {
+      a: this.a,
+      x: this.x,
+      y: this.y,
+      sp: this.sp,
+      pc: this.pc,
+      status: this.status,
+      totalCycles: this.totalCycles,
+      irqLine: this.irqLine,
+      irqRecognized: this.irqRecognized,
+      nmiLine: this.nmiLine,
+      nmiLatched: this.nmiLatched,
+      execution: this.execution ? { ...this.execution } : undefined,
     };
-    const value = () => {
-      if (o.kind === "value") return o.value;
-      return this.read(address());
+  }
+
+  /** Restores a state previously returned by saveState without accessing the bus. */
+  loadState(state: CpuState) {
+    if (this.clockActive) throw new Error("cannot restore CPU state during a clock");
+    this.a = state.a;
+    this.x = state.x;
+    this.y = state.y;
+    this.sp = state.sp;
+    this.pc = state.pc;
+    this.status = state.status;
+    this.totalCycles = state.totalCycles;
+    this.irqLine = state.irqLine;
+    this.irqRecognized = state.irqRecognized;
+    this.nmiLine = state.nmiLine;
+    this.nmiLatched = state.nmiLatched;
+    this.execution = state.execution ? { ...state.execution } : undefined;
+  }
+
+  /** Executes one explicit state-machine cycle for the active sequence. */
+  private executeCycle(execution: CpuExecutionState) {
+    const cycle = execution.cycle + 1;
+    switch (execution.kind) {
+      case "reset":
+        return this.executeResetCycle(execution, cycle);
+      case "irq":
+      case "nmi":
+        return this.executeInterruptCycle(execution, cycle);
+      case "instruction":
+        return this.executeInstructionCycle(execution, cycle);
+    }
+  }
+
+  /** Performs one cycle of the RESET sequence. */
+  private executeResetCycle(state: CpuExecutionState, cycle: number) {
+    // https://www.nesdev.org/wiki/CPU_interrupts#IRQ_and_NMI_tick-by-tick_execution
+    switch (cycle) {
+      case 1:
+      case 2:
+        this.read(this.pc);
+        return false;
+      case 3:
+      case 4:
+      case 5:
+        this.read(0x100 | this.sp);
+        this.sp = (this.sp - 1) & 0xff;
+        return false;
+      case 6:
+        state.lo = this.read(RESET_VECTOR);
+        return false;
+      case 7:
+        state.hi = this.read(RESET_VECTOR + 1);
+        this.pc = state.lo | (state.hi << 8);
+        return true;
+    }
+    throw new Error(`invalid RESET cycle ${cycle}`);
+  }
+
+  /** Performs one cycle of IRQ or NMI entry. */
+  private executeInterruptCycle(state: CpuExecutionState, cycle: number) {
+    // https://www.nesdev.org/wiki/CPU_interrupts#IRQ_and_NMI_tick-by-tick_execution
+    const vector = state.vector!;
+    switch (cycle) {
+      case 1:
+      case 2:
+        this.read(this.pc);
+        return false;
+      case 3:
+        this.pushStack(this.pc >> 8);
+        return false;
+      case 4:
+        this.pushStack(this.pc);
+        return false;
+      case 5:
+        this.pushStack((this.status | CpuFlag.unused) & ~CpuFlag.break);
+        this.setFlag(CpuFlag.interrupt, true);
+        return false;
+      case 6:
+        state.lo = this.read(vector);
+        return false;
+      case 7:
+        state.hi = this.read(vector + 1);
+        this.pc = state.lo | (state.hi << 8);
+        return true;
+    }
+    throw new Error(`invalid ${state.kind.toUpperCase()} cycle ${cycle}`);
+  }
+
+  /** Fetches or advances one cycle of an instruction. */
+  private executeInstructionCycle(state: CpuExecutionState, cycle: number) {
+    if (cycle === 1) {
+      const at = this.pc;
+      const opcode = this.fetchPc();
+      const instruction = INSTRUCTIONS[opcode];
+      if (!instruction)
+        throw new Error(
+          `undefined opcode $${opcode.toString(16).padStart(2, "0")} at $${at.toString(16).padStart(4, "0")}`,
+        );
+      state.opcode = opcode;
+      state.operation = instruction.operation;
+      state.mode = instruction.mode;
+      return false;
+    }
+
+    const instructionPattern = (operation: Operation, mode: AddressingMode): InstructionPattern => {
+      if (branchOperations.has(operation)) return "branch";
+      if (controlOperations.has(operation)) return "control";
+      if (mode === "acc") return "accumulator";
+      if (mode === "imp") return "implied";
+      if (readOperations.has(operation)) return "read";
+      if (writeOperations.has(operation)) return "write";
+      if (modifyOperations.has(operation)) return "modify";
+      throw new Error(`${operation} cannot be classified`);
     };
 
-    const store = (v: number) => this.bus.write(address(), v & 0xff);
+    // Bus accesses for each cycle are described in here: https://xotmatrix.com/6502/6502-single-cycle-execution.html
+    const pattern = instructionPattern(state.operation!, state.mode!);
+    switch (pattern) {
+      // No memory access
+      case "accumulator":
+        this.read(this.pc);
+        this.a = this.executeOperationWithResult(state.operation!, this.a);
+        return true;
+      case "implied":
+        this.read(this.pc);
+        this.executeOperation(state.operation!);
+        return true;
 
-    // TODO: Clock level emulation of the 6502's read-modify-write instructions is more complex than this.
-    const readModifyWrite = (modify: (v: number) => number) => {
-      const target = address();
-      const original = this.read(target);
-      this.bus.write(target, original);
-      const modified = modify(original) & 0xff;
-      this.bus.write(target, modified);
-      return modified;
+      // Memory access
+      case "read":
+      case "write":
+      case "modify":
+        return this.executeOperationWithAddressing(state, cycle, pattern);
+
+      // Control flow
+      case "branch":
+        return this.executeBranchOperation(state, cycle);
+      case "control":
+        return this.executeControlOperation(state, cycle);
+    }
+    throw new Error(`instruction $${state.opcode?.toString(16)} has no execution pattern`);
+  }
+
+  /** Executes one instruction cycle with a addressing mode that requires memory access. */
+  private executeOperationWithAddressing(
+    state: CpuExecutionState,
+    cycle: number,
+    pattern: OperandPattern,
+  ) {
+    const execute = (accessCycle: number) => {
+      switch (pattern) {
+        case "read":
+          if (accessCycle === 0) this.executeOperation(state.operation!, this.read(state.address));
+          else throw new Error(`invalid read access cycle ${accessCycle}`);
+          return true;
+        case "write":
+          if (accessCycle === 0)
+            this.write(state.address, this.executeOperationWithResult(state.operation!));
+          else throw new Error(`invalid write access cycle ${accessCycle}`);
+          return true;
+        case "modify":
+          if (accessCycle === 0) {
+            state.data = this.read(state.address);
+            return false;
+          } else if (accessCycle === 1) {
+            this.write(state.address, state.data);
+            return false;
+          } else if (accessCycle === 2) {
+            this.write(
+              state.address,
+              this.executeOperationWithResult(state.operation!, state.data),
+            );
+            return true;
+          }
+          throw new Error(`invalid modify access cycle ${accessCycle}`);
+      }
+      throw new Error(`${state.operation} does not support a memory operand`);
     };
 
-    const setZN = (v: number) => {
-      v &= 0xff;
-      this.setFlag(CpuFlag.zero, v === 0);
-      this.setFlag(CpuFlag.negative, (v & 0x80) !== 0);
-      return v;
-    };
-    const adc = (v: number) => {
-      const sum = this.a + v + (this.flag(CpuFlag.carry) ? 1 : 0);
-      const result = sum & 0xff;
-      this.setFlag(CpuFlag.carry, sum > 0xff);
-      this.setFlag(CpuFlag.overflow, (~(this.a ^ v) & (this.a ^ result) & 0x80) !== 0);
-      this.a = setZN(result);
-    };
-    const shift = (fn: (v: number) => number) => {
-      if (o.kind === "none") this.a = setZN(fn(this.a));
-      else readModifyWrite((v) => setZN(fn(v)));
-    };
-    const compare = (register: number, v: number) => {
-      this.setFlag(CpuFlag.carry, register >= v);
-      setZN(register - v);
+    const executeIndexed = (accessCycle: number) => {
+      switch (pattern) {
+        case "read":
+          if (accessCycle === 0) {
+            const value = this.read(state.provisionalAddress);
+            if (!state.pageCrossed) this.executeOperation(state.operation!, value);
+            return !state.pageCrossed;
+          } else if (accessCycle === 1 && state.pageCrossed) {
+            this.executeOperation(state.operation!, this.read(state.address));
+            return true;
+          }
+          throw new Error(`invalid indexed read cycle ${accessCycle}`);
+        case "write":
+          if (accessCycle === 0) {
+            this.read(state.provisionalAddress);
+            return false;
+          } else if (accessCycle === 1) {
+            this.write(state.address, this.executeOperationWithResult(state.operation!));
+            return true;
+          }
+          throw new Error(`invalid indexed write cycle ${accessCycle}`);
+        case "modify":
+          if (accessCycle === 0) this.read(state.provisionalAddress);
+          else if (accessCycle === 1) state.data = this.read(state.address);
+          else if (accessCycle === 2) this.write(state.address, state.data);
+          else if (accessCycle === 3) {
+            this.write(
+              state.address,
+              this.executeOperationWithResult(state.operation!, state.data),
+            );
+            return true;
+          } else throw new Error(`invalid indexed modify cycle ${accessCycle}`);
+          return false;
+      }
     };
 
-    const branch = (condition: boolean, offset: number) => {
-      if (!condition) return 0;
-      const previousPc = this.pc;
-      this.pc = (this.pc + (offset < 0x80 ? offset : offset - 0x100)) & 0xffff;
-      return 1 + ((previousPc & 0xff00) !== (this.pc & 0xff00) ? 1 : 0);
+    const setIndexedAddress = (base: number, index: number) => {
+      state.address = (base + index) & 0xffff;
+      state.provisionalAddress = (base & 0xff00) | (state.address & 0xff);
+      state.pageCrossed = state.provisionalAddress !== state.address;
     };
 
-    const pull = () => {
-      this.sp = (this.sp + 1) & 0xff;
-      return this.read(0x100 | this.sp);
-    };
-    const pull16 = () => {
-      const lo = pull(),
-        hi = pull();
-      return lo | (hi << 8);
+    switch (state.mode) {
+      case "imm":
+        this.executeOperation(state.operation!, this.fetchPc());
+        return true;
+      case "zp":
+        if (cycle === 2) {
+          state.address = this.fetchPc();
+          return false;
+        }
+        return execute(cycle - 3);
+      case "zpx":
+      case "zpy":
+        if (cycle === 2) {
+          state.lo = this.fetchPc();
+          return false;
+        }
+        if (cycle === 3) {
+          this.read(state.lo);
+          const index = state.mode === "zpx" ? this.x : this.y;
+          state.address = (state.lo + index) & 0xff;
+          return false;
+        }
+        return execute(cycle - 4);
+      case "abs":
+        if (cycle === 2) {
+          state.lo = this.fetchPc();
+          return false;
+        }
+        if (cycle === 3) {
+          state.hi = this.fetchPc();
+          state.address = state.lo | (state.hi << 8);
+          return false;
+        }
+        return execute(cycle - 4);
+      case "abx":
+      case "aby":
+        if (cycle === 2) {
+          state.lo = this.fetchPc();
+          return false;
+        }
+        if (cycle === 3) {
+          state.hi = this.fetchPc();
+          const base = state.lo | (state.hi << 8);
+          const index = state.mode === "abx" ? this.x : this.y;
+          setIndexedAddress(base, index);
+          return false;
+        }
+        return executeIndexed(cycle - 4);
+      case "izx":
+        if (cycle === 2) state.lo = this.fetchPc();
+        else if (cycle === 3) {
+          this.read(state.lo);
+          state.lo = (state.lo + this.x) & 0xff;
+        } else if (cycle === 4) state.data = this.read(state.lo);
+        else if (cycle === 5) {
+          state.hi = this.read((state.lo + 1) & 0xff);
+          state.address = state.data | (state.hi << 8);
+        } else return execute(cycle - 6);
+        return false;
+      case "izy":
+        if (cycle === 2) state.lo = this.fetchPc();
+        else if (cycle === 3) state.data = this.read(state.lo);
+        else if (cycle === 4) {
+          state.hi = this.read((state.lo + 1) & 0xff);
+          const base = state.data | (state.hi << 8);
+          setIndexedAddress(base, this.y);
+        } else return executeIndexed(cycle - 5);
+        return false;
+    }
+    throw new Error(`unsupported operand mode ${state.mode}`);
+  }
+
+  /** Applies the register, flag, or value-producing effect of a non-control operation. */
+  private executeOperation(operation: Operation, value?: number): number | undefined {
+    const operand = () => {
+      if (value === undefined) throw new Error(`${operation} requires an operand`);
+      return value;
     };
 
     // https://www.nesdev.org/wiki/Instruction_reference
-    switch (i.operation) {
+    switch (operation) {
       // Access
       case "LDA":
-        this.a = setZN(value());
-        break;
+        this.a = this.setZN(operand());
+        return;
       case "STA":
-        store(this.a);
-        break;
+        return this.a;
       case "LDX":
-        this.x = setZN(value());
-        break;
+        this.x = this.setZN(operand());
+        return;
       case "STX":
-        store(this.x);
-        break;
+        return this.x;
       case "LDY":
-        this.y = setZN(value());
-        break;
+        this.y = this.setZN(operand());
+        return;
       case "STY":
-        store(this.y);
-        break;
+        return this.y;
 
       // Transfer
       case "TAX":
-        this.x = setZN(this.a);
-        break;
+        this.x = this.setZN(this.a);
+        return;
       case "TXA":
-        this.a = setZN(this.x);
-        break;
+        this.a = this.setZN(this.x);
+        return;
       case "TAY":
-        this.y = setZN(this.a);
-        break;
+        this.y = this.setZN(this.a);
+        return;
       case "TYA":
-        this.a = setZN(this.y);
-        break;
+        this.a = this.setZN(this.y);
+        return;
 
       // Arithmetic
       case "ADC":
-        adc(value());
-        break;
+        this.adc(operand());
+        return;
       case "SBC":
-        adc(value() ^ 0xff);
-        break;
+        this.adc(operand() ^ 0xff);
+        return;
       case "INC":
-        readModifyWrite((v) => setZN(v + 1));
-        break;
+        return this.setZN(operand() + 1);
       case "DEC":
-        readModifyWrite((v) => setZN(v - 1));
-        break;
+        return this.setZN(operand() - 1);
       case "INX":
-        this.x = setZN(this.x + 1);
-        break;
+        this.x = this.setZN(this.x + 1);
+        return;
       case "DEX":
-        this.x = setZN(this.x - 1);
-        break;
+        this.x = this.setZN(this.x - 1);
+        return;
       case "INY":
-        this.y = setZN(this.y + 1);
-        break;
+        this.y = this.setZN(this.y + 1);
+        return;
       case "DEY":
-        this.y = setZN(this.y - 1);
-        break;
+        this.y = this.setZN(this.y - 1);
+        return;
 
       // Shift
-      case "ASL":
-        shift((v) => {
-          this.setFlag(CpuFlag.carry, (v & 0x80) !== 0);
-          return v << 1;
-        });
-        break;
-      case "LSR":
-        shift((v) => {
-          this.setFlag(CpuFlag.carry, (v & 1) !== 0);
-          return v >>> 1;
-        });
-        break;
-      case "ROL":
-        shift((v) => {
-          const c = this.flag(CpuFlag.carry) ? 1 : 0;
-          this.setFlag(CpuFlag.carry, (v & 0x80) !== 0);
-          return (v << 1) | c;
-        });
-        break;
-      case "ROR":
-        shift((v) => {
-          const c = this.flag(CpuFlag.carry) ? 0x80 : 0;
-          this.setFlag(CpuFlag.carry, (v & 1) !== 0);
-          return (v >>> 1) | c;
-        });
-        break;
+      case "ASL": {
+        const value = operand();
+        this.setFlag(CpuFlag.carry, (value & 0x80) !== 0);
+        return this.setZN(value << 1);
+      }
+      case "LSR": {
+        const value = operand();
+        this.setFlag(CpuFlag.carry, (value & 1) !== 0);
+        return this.setZN(value >>> 1);
+      }
+      case "ROL": {
+        const value = operand();
+        const carry = this.flag(CpuFlag.carry) ? 1 : 0;
+        this.setFlag(CpuFlag.carry, (value & 0x80) !== 0);
+        return this.setZN((value << 1) | carry);
+      }
+      case "ROR": {
+        const value = operand();
+        const carry = this.flag(CpuFlag.carry) ? 0x80 : 0;
+        this.setFlag(CpuFlag.carry, (value & 1) !== 0);
+        return this.setZN((value >>> 1) | carry);
+      }
 
       // Bitwise
       case "AND":
-        this.a = setZN(this.a & value());
-        break;
+        this.a = this.setZN(this.a & operand());
+        return;
       case "ORA":
-        this.a = setZN(this.a | value());
-        break;
+        this.a = this.setZN(this.a | operand());
+        return;
       case "EOR":
-        this.a = setZN(this.a ^ value());
-        break;
+        this.a = this.setZN(this.a ^ operand());
+        return;
       case "BIT": {
-        const v = value();
-        this.setFlag(CpuFlag.zero, (this.a & v) === 0);
-        this.setFlag(CpuFlag.overflow, (v & 0x40) !== 0);
-        this.setFlag(CpuFlag.negative, (v & 0x80) !== 0);
-        break;
+        const value = operand();
+        this.setFlag(CpuFlag.zero, (this.a & value) === 0);
+        this.setFlag(CpuFlag.overflow, (value & 0x40) !== 0);
+        this.setFlag(CpuFlag.negative, (value & 0x80) !== 0);
+        return;
       }
 
       // Compare
       case "CMP":
-        compare(this.a, value());
-        break;
+        this.cmp(this.a, operand());
+        return;
       case "CPX":
-        compare(this.x, value());
-        break;
+        this.cmp(this.x, operand());
+        return;
       case "CPY":
-        compare(this.y, value());
-        break;
+        this.cmp(this.y, operand());
+        return;
 
       // Branch
-      case "BCC":
-        return branch(!this.flag(CpuFlag.carry), value());
-      case "BCS":
-        return branch(this.flag(CpuFlag.carry), value());
-      case "BEQ":
-        return branch(this.flag(CpuFlag.zero), value());
-      case "BNE":
-        return branch(!this.flag(CpuFlag.zero), value());
-      case "BPL":
-        return branch(!this.flag(CpuFlag.negative), value());
-      case "BMI":
-        return branch(this.flag(CpuFlag.negative), value());
-      case "BVC":
-        return branch(!this.flag(CpuFlag.overflow), value());
-      case "BVS":
-        return branch(this.flag(CpuFlag.overflow), value());
-
       // Jump
-      case "JMP":
-        this.pc = address();
-        break;
-      case "JSR":
-        this.push16((this.pc - 1) & 0xffff);
-        this.pc = address();
-        break;
-      case "RTS":
-        this.pc = (pull16() + 1) & 0xffff;
-        break;
-      case "BRK":
-        this.pc = (this.pc + 1) & 0xffff;
-        this.push16(this.pc);
-        this.push(this.status | CpuFlag.break | CpuFlag.unused);
-        this.setFlag(CpuFlag.interrupt, true);
-        this.pc = this.read16(0xfffe);
-        break;
-      case "RTI":
-        this.status = (pull() | CpuFlag.unused) & ~CpuFlag.break;
-        this.pc = pull16();
-        break;
+      // this.executeControlOperation()
 
       // Stack
-      case "PHA":
-        this.push(this.a);
-        break;
-      case "PLA":
-        this.a = setZN(pull());
-        break;
-      case "PHP":
-        this.push(this.status | CpuFlag.break | CpuFlag.unused);
-        break;
-      case "PLP":
-        this.status = (pull() | CpuFlag.unused) & ~CpuFlag.break;
-        break;
+      // this.executeControlOperation()
+      case "TSX":
+        this.x = this.setZN(this.sp);
+        return;
       case "TXS":
         this.sp = this.x;
-        break;
-      case "TSX":
-        this.x = setZN(this.sp);
-        break;
+        return;
 
       // Flags
       case "CLC":
         this.setFlag(CpuFlag.carry, false);
-        break;
+        return;
       case "SEC":
         this.setFlag(CpuFlag.carry, true);
-        break;
+        return;
       case "CLI":
         this.setFlag(CpuFlag.interrupt, false);
-        break;
+        return;
       case "SEI":
         this.setFlag(CpuFlag.interrupt, true);
-        break;
+        return;
       case "CLD":
         this.setFlag(CpuFlag.decimal, false);
-        break;
+        return;
       case "SED":
         this.setFlag(CpuFlag.decimal, true);
-        break;
+        return;
       case "CLV":
         this.setFlag(CpuFlag.overflow, false);
-        break;
+        return;
 
       // Other
       case "NOP":
-        break;
-
-      default:
-        i.operation satisfies never;
+        return;
     }
-    return 0;
+    throw new Error(`${operation} uses a dedicated execution sequence`);
+  }
+
+  /** Performs one relative-branch cycle without dynamically inserting work. */
+  private executeBranchOperation(state: CpuExecutionState, cycle: number) {
+    if (cycle === 2) {
+      const offset = this.fetchPc();
+      const cond = () => {
+        switch (state.operation!) {
+          case "BCC":
+            return (this.status & CpuFlag.carry) === 0;
+          case "BCS":
+            return (this.status & CpuFlag.carry) !== 0;
+          case "BEQ":
+            return (this.status & CpuFlag.zero) !== 0;
+          case "BNE":
+            return (this.status & CpuFlag.zero) === 0;
+          case "BPL":
+            return (this.status & CpuFlag.negative) === 0;
+          case "BMI":
+            return (this.status & CpuFlag.negative) !== 0;
+          case "BVC":
+            return (this.status & CpuFlag.overflow) === 0;
+          case "BVS":
+            return (this.status & CpuFlag.overflow) !== 0;
+          default:
+            throw new Error(`${state.operation} is not a branch operation`);
+        }
+      };
+      state.branchTaken = cond();
+      if (!state.branchTaken) return true;
+      const previousPc = this.pc;
+      state.address = (previousPc + (offset < 0x80 ? offset : offset - 0x100)) & 0xffff;
+      state.provisionalAddress = (previousPc & 0xff00) | (state.address & 0xff);
+      state.pageCrossed = state.provisionalAddress !== state.address;
+      return false;
+    } else if (cycle === 3 && state.branchTaken) {
+      this.read(this.pc);
+      this.pc = state.address;
+      return !state.pageCrossed;
+    } else if (cycle === 4 && state.pageCrossed) {
+      this.read(state.provisionalAddress);
+      return true;
+    } else throw new Error(`invalid ${state.operation} branch cycle ${cycle}`);
+  }
+
+  /** Performs one control-flow or hardware-stack instruction cycle. */
+  private executeControlOperation(state: CpuExecutionState, cycle: number) {
+    switch (state.operation) {
+      case "JMP":
+        if (cycle === 2) {
+          state.lo = this.fetchPc();
+          return false;
+        } else if (state.mode === "abs" && cycle === 3) {
+          state.hi = this.read(this.pc);
+          this.pc = state.lo | (state.hi << 8);
+          return true;
+        } else if (state.mode === "ind") {
+          if (cycle === 3) {
+            state.hi = this.fetchPc();
+            state.address = state.lo | (state.hi << 8);
+            return false;
+          } else if (cycle === 4) {
+            state.lo = this.read(state.address);
+            return false;
+          } else if (cycle === 5) {
+            state.hi = this.read((state.address & 0xff00) | ((state.address + 1) & 0xff));
+            this.pc = state.lo | (state.hi << 8);
+            return true;
+          }
+        }
+        throw new Error(`invalid JMP cycle ${cycle}`);
+      case "JSR":
+        if (cycle === 2) state.lo = this.fetchPc();
+        else if (cycle === 3) this.read(0x100 | this.sp);
+        else if (cycle === 4) this.pushStack(this.pc >> 8);
+        else if (cycle === 5) this.pushStack(this.pc);
+        else if (cycle === 6) {
+          state.hi = this.read(this.pc);
+          this.pc = state.lo | (state.hi << 8);
+        } else throw new Error(`invalid JSR cycle ${cycle}`);
+        return cycle === 6;
+      case "RTS":
+        if (cycle === 2) this.read(this.pc);
+        else if (cycle === 3) this.read(0x100 | this.sp);
+        else if (cycle === 4) state.lo = this.pullStack();
+        else if (cycle === 5) {
+          state.hi = this.pullStack();
+          state.address = state.lo | (state.hi << 8);
+        } else if (cycle === 6) {
+          this.read(state.address);
+          this.pc = (state.address + 1) & 0xffff;
+        } else throw new Error(`invalid RTS cycle ${cycle}`);
+        return cycle === 6;
+      case "BRK":
+        if (cycle === 2) this.fetchPc();
+        else if (cycle === 3) this.pushStack(this.pc >> 8);
+        else if (cycle === 4) this.pushStack(this.pc);
+        else if (cycle === 5) {
+          this.pushStack(this.status | CpuFlag.break | CpuFlag.unused);
+          this.setFlag(CpuFlag.interrupt, true);
+        } else if (cycle === 6) state.lo = this.read(IRQ_VECTOR);
+        else if (cycle === 7) {
+          state.hi = this.read(IRQ_VECTOR + 1);
+          this.pc = state.lo | (state.hi << 8);
+        } else throw new Error(`invalid BRK cycle ${cycle}`);
+        return cycle === 7;
+      case "RTI":
+        if (cycle === 2) this.read(this.pc);
+        else if (cycle === 3) this.read(0x100 | this.sp);
+        else if (cycle === 4) this.status = (this.pullStack() | CpuFlag.unused) & ~CpuFlag.break;
+        else if (cycle === 5) state.lo = this.pullStack();
+        else if (cycle === 6) {
+          state.hi = this.pullStack();
+          this.pc = state.lo | (state.hi << 8);
+        } else throw new Error(`invalid RTI cycle ${cycle}`);
+        return cycle === 6;
+
+      // Stack
+      case "PHA":
+      case "PHP":
+        if (cycle === 2) this.read(this.pc);
+        else if (cycle === 3)
+          this.pushStack(
+            state.operation === "PHA" ? this.a : this.status | CpuFlag.break | CpuFlag.unused,
+          );
+        else throw new Error(`invalid ${state.operation} cycle ${cycle}`);
+        return cycle === 3;
+      case "PLA":
+      case "PLP":
+        if (cycle === 2) this.read(this.pc);
+        else if (cycle === 3) this.read(0x100 | this.sp);
+        else if (cycle === 4) {
+          const value = this.pullStack();
+          if (state.operation === "PLA") this.a = this.setZN(value);
+          else this.status = (value | CpuFlag.unused) & ~CpuFlag.break;
+        } else throw new Error(`invalid ${state.operation} cycle ${cycle}`);
+        return cycle === 4;
+    }
+    throw new Error(`${state.operation} is not a control operation`);
+  }
+
+  /** Executes a non-control operation and returns its result, throwing if none is produced. */
+  private executeOperationWithResult(operation: Operation, operand?: number) {
+    const result = this.executeOperation(operation, operand);
+    if (result === undefined) throw new Error(`${operation} does not produce a value`);
+    return result;
+  }
+
+  /** Normalizes a byte, updates zero/negative flags, and returns the byte. */
+  private setZN(value: number) {
+    value &= 0xff;
+    this.setFlag(CpuFlag.zero, value === 0);
+    this.setFlag(CpuFlag.negative, (value & 0x80) !== 0);
+    return value;
+  }
+
+  /** Performs binary RP2A03 addition and updates A, C, V, Z, and N. */
+  private adc(operand: number) {
+    const sum = this.a + operand + (this.flag(CpuFlag.carry) ? 1 : 0);
+    const result = sum & 0xff;
+    this.setFlag(CpuFlag.carry, sum > 0xff);
+    this.setFlag(CpuFlag.overflow, (~(this.a ^ operand) & (this.a ^ result) & 0x80) !== 0);
+    this.a = this.setZN(result);
+  }
+
+  /** Compares a register with an operand and updates C, Z, and N. */
+  private cmp(register: number, operand: number) {
+    this.setFlag(CpuFlag.carry, register >= operand);
+    this.setZN(register - operand);
   }
 }

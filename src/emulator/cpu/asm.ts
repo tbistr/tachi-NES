@@ -1,5 +1,6 @@
 import {
   INSTRUCTIONS,
+  instructionBytes,
   type AddressingMode,
   type Instruction,
   type Operation,
@@ -114,7 +115,7 @@ function parse(source: string, origin: number) {
       const opcode = opcodeFor(operation, mode);
       if (opcode === undefined) fail(line, `${operation} does not support ${mode} addressing`);
       lines.push({ line, address, operation, mode, operand });
-      address += INSTRUCTIONS[opcode]!.bytes;
+      address += instructionBytes(mode);
     }
     if (address > 0x10000) fail(line, "program exceeds the 16-bit address space");
   }
@@ -227,16 +228,14 @@ export function disassemble(data: ArrayLike<number>, origin = 0x8000): Disassemb
     const address = origin + offset;
     const opcode = data[offset] & 0xff;
     const instruction = INSTRUCTIONS[opcode];
-    if (!instruction || offset + instruction.bytes > data.length) {
+    const length = instruction ? instructionBytes(instruction.mode) : 1;
+    if (!instruction || offset + length > data.length) {
       lines.push({ address, bytes: [opcode], text: `.byte ${hex(opcode, 2)}` });
       offset++;
       continue;
     }
 
-    const bytes = Array.from(
-      { length: instruction.bytes },
-      (_, index) => data[offset + index] & 0xff,
-    );
+    const bytes = Array.from({ length }, (_, index) => data[offset + index] & 0xff);
     const operand = disassembledOperand(instruction.mode, bytes[1] ?? 0, bytes[2] ?? 0, address);
     lines.push({
       address,
@@ -244,7 +243,7 @@ export function disassemble(data: ArrayLike<number>, origin = 0x8000): Disassemb
       text: operand ? `${instruction.operation} ${operand}` : instruction.operation,
       instruction,
     });
-    offset += instruction.bytes;
+    offset += length;
   }
   return lines;
 }

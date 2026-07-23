@@ -74,9 +74,6 @@ export type AddressingMode =
 export type Instruction = {
   operation: Operation;
   mode: AddressingMode;
-  bytes: number;
-  cycles: number;
-  extraCycleOnPageCross?: boolean;
 };
 
 const bytesByAddressingMode: Record<AddressingMode, number> = {
@@ -95,27 +92,20 @@ const bytesByAddressingMode: Record<AddressingMode, number> = {
   rel: 2,
 };
 
-type OpcodeDefinition = readonly [
-  opcode: number,
-  mode: AddressingMode,
-  cycles: number,
-  extraCycleOnPageCross?: boolean,
-];
+/** Returns the encoded instruction length for an addressing mode. */
+export function instructionBytes(mode: AddressingMode) {
+  return bytesByAddressingMode[mode];
+}
+
+type OpcodeDefinition = readonly [opcode: number, mode: AddressingMode];
 
 const opcodeTable: Array<Instruction | undefined> = new Array(256);
 
 /** Registers every opcode variant for an official 6502 instruction. */
 function defineInstruction(operation: Operation, definitions: readonly OpcodeDefinition[]) {
-  for (const [opcode, mode, cycles, extraCycleOnPageCross] of definitions) {
+  for (const [opcode, mode] of definitions) {
     if (opcodeTable[opcode]) throw new Error("Duplicate opcode");
-    if (cycles < 1) throw new Error("Invalid cycle count");
-    opcodeTable[opcode] = {
-      operation,
-      mode,
-      bytes: bytesByAddressingMode[mode],
-      cycles,
-      extraCycleOnPageCross,
-    };
+    opcodeTable[opcode] = { operation, mode };
   }
 }
 
@@ -125,221 +115,219 @@ function defineInstruction(operation: Operation, definitions: readonly OpcodeDef
 
 // Access
 defineInstruction("LDA", [
-  [0xa9, "imm", 2],
-  [0xa5, "zp", 3],
-  [0xb5, "zpx", 4],
-  [0xad, "abs", 4],
-  [0xbd, "abx", 4, true],
-  [0xb9, "aby", 4, true],
-  [0xa1, "izx", 6],
-  [0xb1, "izy", 5, true],
+  [0xa9, "imm"],
+  [0xa5, "zp"],
+  [0xb5, "zpx"],
+  [0xad, "abs"],
+  [0xbd, "abx"],
+  [0xb9, "aby"],
+  [0xa1, "izx"],
+  [0xb1, "izy"],
 ]);
 defineInstruction("STA", [
-  [0x85, "zp", 3],
-  [0x95, "zpx", 4],
-  [0x8d, "abs", 4],
-  [0x9d, "abx", 5],
-  [0x99, "aby", 5],
-  [0x81, "izx", 6],
-  [0x91, "izy", 6],
+  [0x85, "zp"],
+  [0x95, "zpx"],
+  [0x8d, "abs"],
+  [0x9d, "abx"],
+  [0x99, "aby"],
+  [0x81, "izx"],
+  [0x91, "izy"],
 ]);
 defineInstruction("LDX", [
-  [0xa2, "imm", 2],
-  [0xa6, "zp", 3],
-  [0xb6, "zpy", 4],
-  [0xae, "abs", 4],
-  [0xbe, "aby", 4, true],
+  [0xa2, "imm"],
+  [0xa6, "zp"],
+  [0xb6, "zpy"],
+  [0xae, "abs"],
+  [0xbe, "aby"],
 ]);
 defineInstruction("STX", [
-  [0x86, "zp", 3],
-  [0x96, "zpy", 4],
-  [0x8e, "abs", 4],
+  [0x86, "zp"],
+  [0x96, "zpy"],
+  [0x8e, "abs"],
 ]);
 defineInstruction("LDY", [
-  [0xa0, "imm", 2],
-  [0xa4, "zp", 3],
-  [0xb4, "zpx", 4],
-  [0xac, "abs", 4],
-  [0xbc, "abx", 4, true],
+  [0xa0, "imm"],
+  [0xa4, "zp"],
+  [0xb4, "zpx"],
+  [0xac, "abs"],
+  [0xbc, "abx"],
 ]);
 defineInstruction("STY", [
-  [0x84, "zp", 3],
-  [0x94, "zpx", 4],
-  [0x8c, "abs", 4],
+  [0x84, "zp"],
+  [0x94, "zpx"],
+  [0x8c, "abs"],
 ]);
 
 // Transfer
-defineInstruction("TAX", [[0xaa, "imp", 2]]);
-defineInstruction("TXA", [[0x8a, "imp", 2]]);
-defineInstruction("TAY", [[0xa8, "imp", 2]]);
-defineInstruction("TYA", [[0x98, "imp", 2]]);
+defineInstruction("TAX", [[0xaa, "imp"]]);
+defineInstruction("TXA", [[0x8a, "imp"]]);
+defineInstruction("TAY", [[0xa8, "imp"]]);
+defineInstruction("TYA", [[0x98, "imp"]]);
 
 // Arithmetic
 defineInstruction("ADC", [
-  [0x69, "imm", 2],
-  [0x65, "zp", 3],
-  [0x75, "zpx", 4],
-  [0x6d, "abs", 4],
-  [0x7d, "abx", 4, true],
-  [0x79, "aby", 4, true],
-  [0x61, "izx", 6],
-  [0x71, "izy", 5, true],
+  [0x69, "imm"],
+  [0x65, "zp"],
+  [0x75, "zpx"],
+  [0x6d, "abs"],
+  [0x7d, "abx"],
+  [0x79, "aby"],
+  [0x61, "izx"],
+  [0x71, "izy"],
 ]);
 defineInstruction("SBC", [
-  [0xe9, "imm", 2],
-  [0xe5, "zp", 3],
-  [0xf5, "zpx", 4],
-  [0xed, "abs", 4],
-  [0xfd, "abx", 4, true],
-  [0xf9, "aby", 4, true],
-  [0xe1, "izx", 6],
-  [0xf1, "izy", 5, true],
+  [0xe9, "imm"],
+  [0xe5, "zp"],
+  [0xf5, "zpx"],
+  [0xed, "abs"],
+  [0xfd, "abx"],
+  [0xf9, "aby"],
+  [0xe1, "izx"],
+  [0xf1, "izy"],
 ]);
 defineInstruction("INC", [
-  [0xe6, "zp", 5],
-  [0xf6, "zpx", 6],
-  [0xee, "abs", 6],
-  [0xfe, "abx", 7],
+  [0xe6, "zp"],
+  [0xf6, "zpx"],
+  [0xee, "abs"],
+  [0xfe, "abx"],
 ]);
 defineInstruction("DEC", [
-  [0xc6, "zp", 5],
-  [0xd6, "zpx", 6],
-  [0xce, "abs", 6],
-  [0xde, "abx", 7],
+  [0xc6, "zp"],
+  [0xd6, "zpx"],
+  [0xce, "abs"],
+  [0xde, "abx"],
 ]);
-defineInstruction("INX", [[0xe8, "imp", 2]]);
-defineInstruction("DEX", [[0xca, "imp", 2]]);
-defineInstruction("INY", [[0xc8, "imp", 2]]);
-defineInstruction("DEY", [[0x88, "imp", 2]]);
+defineInstruction("INX", [[0xe8, "imp"]]);
+defineInstruction("DEX", [[0xca, "imp"]]);
+defineInstruction("INY", [[0xc8, "imp"]]);
+defineInstruction("DEY", [[0x88, "imp"]]);
 
 // Shift
 defineInstruction("ASL", [
-  [0x0a, "acc", 2],
-  [0x06, "zp", 5],
-  [0x16, "zpx", 6],
-  [0x0e, "abs", 6],
-  [0x1e, "abx", 7],
+  [0x0a, "acc"],
+  [0x06, "zp"],
+  [0x16, "zpx"],
+  [0x0e, "abs"],
+  [0x1e, "abx"],
 ]);
 defineInstruction("LSR", [
-  [0x4a, "acc", 2],
-  [0x46, "zp", 5],
-  [0x56, "zpx", 6],
-  [0x4e, "abs", 6],
-  [0x5e, "abx", 7],
+  [0x4a, "acc"],
+  [0x46, "zp"],
+  [0x56, "zpx"],
+  [0x4e, "abs"],
+  [0x5e, "abx"],
 ]);
 defineInstruction("ROL", [
-  [0x2a, "acc", 2],
-  [0x26, "zp", 5],
-  [0x36, "zpx", 6],
-  [0x2e, "abs", 6],
-  [0x3e, "abx", 7],
+  [0x2a, "acc"],
+  [0x26, "zp"],
+  [0x36, "zpx"],
+  [0x2e, "abs"],
+  [0x3e, "abx"],
 ]);
 defineInstruction("ROR", [
-  [0x6a, "acc", 2],
-  [0x66, "zp", 5],
-  [0x76, "zpx", 6],
-  [0x6e, "abs", 6],
-  [0x7e, "abx", 7],
+  [0x6a, "acc"],
+  [0x66, "zp"],
+  [0x76, "zpx"],
+  [0x6e, "abs"],
+  [0x7e, "abx"],
 ]);
 
 // Bitwise
 defineInstruction("AND", [
-  [0x29, "imm", 2],
-  [0x25, "zp", 3],
-  [0x35, "zpx", 4],
-  [0x2d, "abs", 4],
-  [0x3d, "abx", 4, true],
-  [0x39, "aby", 4, true],
-  [0x21, "izx", 6],
-  [0x31, "izy", 5, true],
+  [0x29, "imm"],
+  [0x25, "zp"],
+  [0x35, "zpx"],
+  [0x2d, "abs"],
+  [0x3d, "abx"],
+  [0x39, "aby"],
+  [0x21, "izx"],
+  [0x31, "izy"],
 ]);
 defineInstruction("ORA", [
-  [0x09, "imm", 2],
-  [0x05, "zp", 3],
-  [0x15, "zpx", 4],
-  [0x0d, "abs", 4],
-  [0x1d, "abx", 4, true],
-  [0x19, "aby", 4, true],
-  [0x01, "izx", 6],
-  [0x11, "izy", 5, true],
+  [0x09, "imm"],
+  [0x05, "zp"],
+  [0x15, "zpx"],
+  [0x0d, "abs"],
+  [0x1d, "abx"],
+  [0x19, "aby"],
+  [0x01, "izx"],
+  [0x11, "izy"],
 ]);
 defineInstruction("EOR", [
-  [0x49, "imm", 2],
-  [0x45, "zp", 3],
-  [0x55, "zpx", 4],
-  [0x4d, "abs", 4],
-  [0x5d, "abx", 4, true],
-  [0x59, "aby", 4, true],
-  [0x41, "izx", 6],
-  [0x51, "izy", 5, true],
+  [0x49, "imm"],
+  [0x45, "zp"],
+  [0x55, "zpx"],
+  [0x4d, "abs"],
+  [0x5d, "abx"],
+  [0x59, "aby"],
+  [0x41, "izx"],
+  [0x51, "izy"],
 ]);
 defineInstruction("BIT", [
-  [0x24, "zp", 3],
-  [0x2c, "abs", 4],
+  [0x24, "zp"],
+  [0x2c, "abs"],
 ]);
 
 // Compare
 defineInstruction("CMP", [
-  [0xc9, "imm", 2],
-  [0xc5, "zp", 3],
-  [0xd5, "zpx", 4],
-  [0xcd, "abs", 4],
-  [0xdd, "abx", 4, true],
-  [0xd9, "aby", 4, true],
-  [0xc1, "izx", 6],
-  [0xd1, "izy", 5, true],
+  [0xc9, "imm"],
+  [0xc5, "zp"],
+  [0xd5, "zpx"],
+  [0xcd, "abs"],
+  [0xdd, "abx"],
+  [0xd9, "aby"],
+  [0xc1, "izx"],
+  [0xd1, "izy"],
 ]);
 defineInstruction("CPX", [
-  [0xe0, "imm", 2],
-  [0xe4, "zp", 3],
-  [0xec, "abs", 4],
+  [0xe0, "imm"],
+  [0xe4, "zp"],
+  [0xec, "abs"],
 ]);
 defineInstruction("CPY", [
-  [0xc0, "imm", 2],
-  [0xc4, "zp", 3],
-  [0xcc, "abs", 4],
+  [0xc0, "imm"],
+  [0xc4, "zp"],
+  [0xcc, "abs"],
 ]);
 
-// Branch
-// The branch instructions take +1 cycle if the branch is taken, and an additional +1 cycle if the branch crosses a page boundary.
-// The extra cycle on page crossing is calculated in Cpu.branch(), so we don't need to include it in the instruction definition here.
-defineInstruction("BCC", [[0x90, "rel", 2]]);
-defineInstruction("BCS", [[0xb0, "rel", 2]]);
-defineInstruction("BEQ", [[0xf0, "rel", 2]]);
-defineInstruction("BNE", [[0xd0, "rel", 2]]);
-defineInstruction("BPL", [[0x10, "rel", 2]]);
-defineInstruction("BMI", [[0x30, "rel", 2]]);
-defineInstruction("BVC", [[0x50, "rel", 2]]);
-defineInstruction("BVS", [[0x70, "rel", 2]]);
+// Branch timing is determined by the CPU state machine after evaluating the condition and target.
+defineInstruction("BCC", [[0x90, "rel"]]);
+defineInstruction("BCS", [[0xb0, "rel"]]);
+defineInstruction("BEQ", [[0xf0, "rel"]]);
+defineInstruction("BNE", [[0xd0, "rel"]]);
+defineInstruction("BPL", [[0x10, "rel"]]);
+defineInstruction("BMI", [[0x30, "rel"]]);
+defineInstruction("BVC", [[0x50, "rel"]]);
+defineInstruction("BVS", [[0x70, "rel"]]);
 
 // Jump
 defineInstruction("JMP", [
-  [0x4c, "abs", 3],
-  [0x6c, "ind", 5],
+  [0x4c, "abs"],
+  [0x6c, "ind"],
 ]);
-defineInstruction("JSR", [[0x20, "abs", 6]]);
-defineInstruction("RTS", [[0x60, "imp", 6]]);
-defineInstruction("BRK", [[0x00, "imp", 7]]);
-defineInstruction("RTI", [[0x40, "imp", 6]]);
+defineInstruction("JSR", [[0x20, "abs"]]);
+defineInstruction("RTS", [[0x60, "imp"]]);
+defineInstruction("BRK", [[0x00, "imp"]]);
+defineInstruction("RTI", [[0x40, "imp"]]);
 
 // Stack
-defineInstruction("PHA", [[0x48, "imp", 3]]);
-defineInstruction("PLA", [[0x68, "imp", 4]]);
-defineInstruction("PHP", [[0x08, "imp", 3]]);
-defineInstruction("PLP", [[0x28, "imp", 4]]);
-defineInstruction("TXS", [[0x9a, "imp", 2]]);
-defineInstruction("TSX", [[0xba, "imp", 2]]);
+defineInstruction("PHA", [[0x48, "imp"]]);
+defineInstruction("PLA", [[0x68, "imp"]]);
+defineInstruction("PHP", [[0x08, "imp"]]);
+defineInstruction("PLP", [[0x28, "imp"]]);
+defineInstruction("TXS", [[0x9a, "imp"]]);
+defineInstruction("TSX", [[0xba, "imp"]]);
 
 // Flags
-defineInstruction("CLC", [[0x18, "imp", 2]]);
-defineInstruction("SEC", [[0x38, "imp", 2]]);
-defineInstruction("CLI", [[0x58, "imp", 2]]);
-defineInstruction("SEI", [[0x78, "imp", 2]]);
-defineInstruction("CLD", [[0xd8, "imp", 2]]);
-defineInstruction("SED", [[0xf8, "imp", 2]]);
-defineInstruction("CLV", [[0xb8, "imp", 2]]);
+defineInstruction("CLC", [[0x18, "imp"]]);
+defineInstruction("SEC", [[0x38, "imp"]]);
+defineInstruction("CLI", [[0x58, "imp"]]);
+defineInstruction("SEI", [[0x78, "imp"]]);
+defineInstruction("CLD", [[0xd8, "imp"]]);
+defineInstruction("SED", [[0xf8, "imp"]]);
+defineInstruction("CLV", [[0xb8, "imp"]]);
 
 // Other
-defineInstruction("NOP", [[0xea, "imp", 2]]);
+defineInstruction("NOP", [[0xea, "imp"]]);
 
 export const INSTRUCTIONS: ReadonlyArray<Instruction | undefined> = Object.freeze(opcodeTable);

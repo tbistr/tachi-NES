@@ -15,7 +15,7 @@ export class Nes {
     this.ppu = new Ppu(cartridge);
     this.bus = new Bus(cartridge, this.ppu, this.apu, this.controller);
     this.cpu = new Cpu(this.bus);
-    this.cpu.reset();
+    this.cpu.powerOn();
   }
   static fromRom(data: ArrayBuffer) {
     return new Nes(Cartridge.fromArrayBuffer(data));

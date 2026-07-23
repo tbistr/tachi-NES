@@ -54,7 +54,7 @@ describe("hardware stack", () => {
     cpu.status = CpuFlag.carry | CpuFlag.unused;
     memory.data[0xfffe] = 0x34;
     memory.data[0xffff] = 0x12;
-    cpu.step();
+    expect(cpu.step()).toBe(7);
     expect(memory.writes).toEqual([
       { address: 0x01fd, value: 0x80 },
       { address: 0x01fc, value: 0x02 },
